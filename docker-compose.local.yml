@@ -1,0 +1,161 @@
+services:
+  nginx:
+    container_name: duck-tail-api-nginx
+    build:
+      context: .docker/nginx
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    tty: true
+    ports:
+      - "${NGINX_PORT:-8080}:80"
+    environment:
+      TZ: "${APP_TIMEZONE:-UTC}"
+    volumes:
+      - .:/var/www/html
+      - ./.docker/nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./.docker/nginx/conf.d/api.conf:/etc/nginx/conf.d/api.conf
+    networks:
+      - duck-tail-api-network
+    depends_on:
+      php-fpm:
+        condition: service_healthy
+    # `/up` só responde 200 se o Laravel, o Postgres e o Neo4j responderem.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/up > /dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  php-fpm:
+    container_name: duck-tail-api-php
+    build:
+      context: .docker/php
+      dockerfile: Dockerfile
+      # Só no ambiente local (e no CI): pcov para `make test-coverage`. A produção não leva.
+      args:
+        INSTALL_PCOV: "1"
+    restart: unless-stopped
+    tty: true
+    environment:
+      TZ: "${APP_TIMEZONE:-UTC}"
+      PHP_OPCACHE_VALIDATE_TIMESTAMPS: "${PHP_OPCACHE_VALIDATE_TIMESTAMPS:-1}"
+    volumes:
+      - .:/var/www/html
+      - ./.docker/php/php.ini:/usr/local/etc/php/php.ini
+    networks:
+      - duck-tail-api-network
+    depends_on:
+      pgsql:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "php", "-r", "exit(@fsockopen('127.0.0.1', 9000) ? 0 : 1);"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Tarefas agendadas (routes/console.php), como a limpeza diária de tokens vencidos.
+  scheduler:
+    container_name: duck-tail-api-scheduler
+    build:
+      context: .docker/php
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["php", "artisan", "schedule:work"]
+    environment:
+      TZ: "${APP_TIMEZONE:-UTC}"
+    volumes:
+      - .:/var/www/html
+      - ./.docker/php/php.ini:/usr/local/etc/php/php.ini
+    networks:
+      - duck-tail-api-network
+    depends_on:
+      pgsql:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+
+  pgsql:
+    container_name: duck-tail-api-postgres
+    image: postgres:16.14-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_DATABASE}
+      POSTGRES_USER: ${DB_USERNAME}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      TZ: "${APP_TIMEZONE:-UTC}"
+    ports:
+      - "${FORWARD_DB_PORT:-5432}:5432"
+    volumes:
+      - duck-tail-api-postgres-data:/var/lib/postgresql/data
+      - ./.docker/pgsql/init:/docker-entrypoint-initdb.d
+    networks:
+      - duck-tail-api-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME} -d ${DB_DATABASE}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Grafo (lugares, cidades, temas, empresas, visitas, roteiros). Browser em http://localhost:7474.
+  neo4j:
+    container_name: duck-tail-api-neo4j
+    image: neo4j:5.26.33-community
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: "${NEO4J_USERNAME}/${NEO4J_PASSWORD}"
+      NEO4J_server_memory_heap_initial__size: 256m
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 256m
+      TZ: "${APP_TIMEZONE:-UTC}"
+    ports:
+      - "${FORWARD_NEO4J_HTTP_PORT:-7474}:7474"
+      - "${FORWARD_NEO4J_BOLT_PORT:-7687}:7687"
+    volumes:
+      - duck-tail-api-neo4j-data:/data
+    networks:
+      - duck-tail-api-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:7474 > /dev/null || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
+  # Neo4j dos testes: o Community tem um banco só, então o equivalente ao `${DB_DATABASE}_testing` é um
+  # segundo container, sem volume (tmpfs) e sem porta publicada. Os testes de Feature apagam o grafo
+  # antes de cada teste; o grafo de desenvolvimento nunca é tocado.
+  neo4j-testing:
+    container_name: duck-tail-api-neo4j-testing
+    image: neo4j:5.26.33-community
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: "${NEO4J_USERNAME}/${NEO4J_PASSWORD}"
+      NEO4J_server_memory_heap_initial__size: 256m
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 128m
+      TZ: "${APP_TIMEZONE:-UTC}"
+    tmpfs:
+      - /data
+    networks:
+      - duck-tail-api-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:7474 > /dev/null || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
+networks:
+  duck-tail-api-network:
+    name: duck-tail-api-network
+    driver: bridge
+
+volumes:
+  duck-tail-api-postgres-data:
+    name: duck-tail-api-postgres-data
+  duck-tail-api-neo4j-data:
+    name: duck-tail-api-neo4j-data

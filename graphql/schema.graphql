@@ -1,0 +1,314 @@
+# DuckTail — contrato GraphQL entre a API (Laravel + Lighthouse) e o web (Next.js, graphql-codegen).
+#
+# SDL puro, sem diretivas do Lighthouse: o web gera os tipos lendo este arquivo direto. Cada campo é
+# resolvido por uma classe `App\GraphQL\Resolvers\{Tipo}\{Campo}Resolver` (`App\Base\GraphQL\ResolverProvider`);
+# campo sem classe lê a chave de mesmo nome do array devolvido pelo pai.
+#
+# Erros: `extensions.code` (NOT_FOUND, UNAUTHENTICATED, VALIDATION, CONFLICT, INTERNAL), `extensions.status`
+# (o status HTTP equivalente), `extensions.key` (chave de lang/*/messages.php) e `extensions.messages`
+# ({ "pt-br", "es-mx", "en-us" }, o mesmo formato do `message` das rotas REST).
+# Sessão: `Authorization: Bearer <access_token>` (o mesmo do REST). Sem header, as consultas públicas
+# funcionam; token inválido ou vencido → HTTP 401 no envelope REST (o web renova e repete).
+
+"Ponto turístico: um nó `Place` do grafo."
+type Place {
+    id: ID!
+    name: String!
+    description: String
+    latitude: Float!
+    longitude: Float!
+    "URL absoluta (Wikimedia Commons) ou null."
+    image: String
+    "A localidade mais específica do lugar (ex.: a cidade)."
+    location: Location!
+    categories: [Category!]!
+    themes: [Theme!]!
+    """
+    Ligados por `RELATED_TO` (autor, estilo, curadoria) ou por um tema em comum, com o motivo. Primeiro os
+    da mesma localidade, depois os de categoria em comum, os de melhor nota e os com foto.
+    """
+    related(limit: Int = 10): [RelatedPlace!]!
+    "Lugares a até `radiusKm` deste, do mais perto ao mais longe."
+    nearby(radiusKm: Float = 2): [NearbyPlace!]!
+    "Quem o usuário da sessão segue e já visitou este lugar (vazio sem sessão)."
+    friendsWhoVisited: [Visit!]!
+    "Empresas de turismo que operam aqui ou têm passeio que passa aqui."
+    companies: [Company!]!
+    "Passeios que passam por este lugar."
+    tours: [Tour!]!
+    "Média das notas das visitas (1 a 5, uma casa decimal); null sem nenhuma nota."
+    rating: Float
+    "Quantas visitas deram nota."
+    ratingCount: Int!
+    "A visita do usuário da sessão a este lugar (data e a nota que ele deu); null sem sessão ou sem visita."
+    myVisit: Visit
+}
+
+"""
+Localidade: país, estado, região ou cidade. Uma localidade pode ser filha de outra
+(Brasil → Minas Gerais → Belo Horizonte). `kind`: country | state | region | city.
+"""
+type Location {
+    id: ID!
+    name: String!
+    kind: String!
+    latitude: Float
+    longitude: Float
+    "A localidade imediatamente acima (null na raiz)."
+    parent: Location
+    "Da raiz até o pai (ex.: [Brasil, Minas Gerais] para Belo Horizonte)."
+    ancestors: [Location!]!
+    "Localidades imediatamente abaixo, da que tem mais lugares para a que tem menos."
+    children: [Location!]!
+    "Quantos lugares há nesta localidade e em todas as de baixo."
+    placeCount: Int!
+    """
+    Lugares desta localidade e de todas as de baixo. Sem `term`: por nome. Com `term`: busca textual (nome e
+    descrição, sem diferenciar acentos), o nome igual ao termo primeiro, depois o que começa com ele, depois a
+    relevância. `categoryId` (`Category.id`) filtra nos dois casos. `first`: 1 a 50.
+    """
+    places(term: String, categoryId: ID, first: Int = 20, after: String): PlaceConnection!
+    "Categorias dos lugares desta localidade (e das de baixo), da que tem mais lugares aqui para a que tem menos; até 50."
+    categories: [Category!]!
+    "Empresas sediadas aqui ou que atendem aqui (ou a uma localidade de baixo)."
+    companies: [Company!]!
+    "Passeios que passam por algum lugar desta localidade (ou de uma de baixo)."
+    tours: [Tour!]!
+}
+
+"""
+Categoria de ponto turístico (igreja, museu, ponte…): um nó `Category` do grafo. `id` é um UUID opaco,
+estável e usado na URL do web (`/categories/:id`): não depende do nome nem do idioma.
+"""
+type Category {
+    id: ID!
+    "O nome em português do Brasil (o mesmo de `names.ptBr`); use `names` para mostrar no idioma da tela."
+    name: String!
+    "O nome em cada idioma da API."
+    names: LocalizedName!
+    """
+    Nome de um ícone do Iconify (`conjunto:nome`, ex.: `tabler:building-church`), escolhido pelo nome da
+    categoria; toda categoria tem um (sem palavra-chave conhecida, `tabler:map-pin`).
+    """
+    icon: String!
+    "A foto de curadoria da categoria ou a do lugar mais procurado dela que tem foto; null sem nenhuma."
+    image: String
+    "Quantos lugares têm esta categoria."
+    placeCount: Int!
+}
+
+"""
+Um texto nos três idiomas da API (os mesmos do `messages` dos erros). Sem tradução no Wikidata, `esMx` e
+`enUs` repetem o `ptBr`.
+"""
+type LocalizedName {
+    ptBr: String!
+    esMx: String!
+    enUs: String!
+}
+
+type Theme {
+    name: String!
+    description: String
+    places: [Place!]!
+}
+
+"Empresa de turismo. `kind`: agency | guide | lodging | transport."
+type Company {
+    id: ID!
+    name: String!
+    description: String
+    kind: String
+    website: String
+    phone: String
+    baseLocation: Location
+    "Lugares onde opera ou por onde passam os seus passeios."
+    places: [Place!]!
+    tours: [Tour!]!
+}
+
+"Passeio oferecido por uma empresa: uma sequência de pontos turísticos."
+type Tour {
+    id: ID!
+    name: String!
+    description: String
+    "Duração aproximada, em minutos."
+    durationMinutes: Int
+    "Preço por pessoa (na moeda `currency`), ou null quando sob consulta."
+    price: Float
+    "Código ISO 4217 (ex.: BRL)."
+    currency: String
+    company: Company!
+    "Paradas na ordem do passeio."
+    stops: [TourStop!]!
+}
+
+type TourStop {
+    "1, 2, 3…"
+    order: Int!
+    place: Place!
+}
+
+"Um passeio e quais dos lugares pedidos ele cobre."
+type TourMatch {
+    tour: Tour!
+    "Os ids pedidos por onde o passeio passa (os que ele cobre)."
+    matchedPlaceIds: [ID!]!
+    "true quando passa por todos os lugares pedidos."
+    coversAll: Boolean!
+}
+
+"""
+Um item da busca geral. `kind`: place | location | category | company | tour (o `id` é o do tipo, para
+abrir a página dele). `subtype`: o `kind` da localidade (city, state…) ou da empresa (agency, guide…).
+`context`: a cidade do lugar, a localidade de cima, a base da empresa ou a empresa do passeio.
+`count`: quantos lugares a categoria tem. `image`: só de lugar. `names`: o nome em cada idioma, só de
+categoria (null nos outros tipos).
+"""
+type SearchResult {
+    kind: String!
+    id: ID!
+    name: String!
+    names: LocalizedName
+    subtype: String
+    context: String
+    count: Int
+    image: String
+}
+
+type RelatedPlace {
+    place: Place!
+    reason: String!
+}
+
+type NearbyPlace {
+    place: Place!
+    "Distância em metros."
+    distanceM: Float!
+}
+
+type Visit {
+    user: User!
+    "YYYY-MM-DD"
+    date: String
+    "1 a 5"
+    rating: Int
+}
+
+"Espelho no grafo de um usuário do Postgres (mesmo id)."
+type User {
+    id: ID!
+    name: String!
+    visited: [Place!]!
+    wantsToVisit: [Place!]!
+    "Todos os roteiros para o próprio usuário; só os públicos para os outros."
+    itineraries: [Itinerary!]!
+    following: [User!]!
+}
+
+type Itinerary {
+    id: ID!
+    title: String!
+    isPublic: Boolean!
+    stops: [Stop!]!
+}
+
+type Stop {
+    place: Place!
+    day: Int!
+    order: Int!
+}
+
+type PlaceConnection {
+    edges: [PlaceEdge!]!
+    pageInfo: PageInfo!
+}
+
+type PlaceEdge {
+    node: Place!
+    cursor: String!
+}
+
+type PageInfo {
+    hasNextPage: Boolean!
+    endCursor: String
+}
+
+type Query {
+    "null quando não existe."
+    place(id: ID!): Place
+    """
+    Busca textual (nome e descrição, sem diferenciar acentos) e/ou por categoria: `category` pelo nome,
+    `categoryId` pelo id (`Category.id`). Com termo: o nome igual ao termo primeiro, depois o que começa com
+    ele, depois a relevância. `first`: 1 a 50.
+    """
+    searchPlaces(term: String, category: String, categoryId: ID, first: Int = 20, after: String): PlaceConnection!
+    """
+    Busca geral (sugestões enquanto se digita): lugares, localidades, categorias, empresas e passeios cujo
+    nome (ou, para lugar, a descrição) começa com as palavras do termo, sem diferenciar acentos. Até 5 de cada
+    tipo; primeiro o nome igual ao termo, depois o que começa com ele; categorias e localidades antes. Termo
+    em branco → []. `limit`: 1 a 20.
+    """
+    search(term: String!, limit: Int = 8): [SearchResult!]!
+    "null quando não existe."
+    category(id: ID!): Category
+    "Categorias com pelo menos um lugar, da que tem mais lugares para a que tem menos. `limit`: 1 a 50."
+    categories(limit: Int = 24): [Category!]!
+    nearbyPlaces(lat: Float!, lng: Float!, radiusKm: Float = 5): [NearbyPlace!]!
+    """
+    Lugares com foto de uma localidade (e das de baixo) ou de todas: os de melhor nota média primeiro (sem
+    nota por último), depois os mais procurados (passeios, visitas e ligações). `limit`: 1 a 50.
+    """
+    featuredPlaces(locationId: ID, limit: Int = 12): [Place!]!
+    "Lugares do mesmo tema a até `radiusKm` do ponto de partida, do mais perto ao mais longe."
+    suggestedItinerary(placeId: ID!, theme: String!, radiusKm: Float = 10): [NearbyPlace!]!
+    "Quem visitou o que você visitou também visitou… Requer sessão."
+    recommendations(limit: Int = 10): [Place!]!
+    "null quando não existe."
+    location(id: ID!): Location
+    """
+    Localidades filhas de `parentId`; sem ele, todas as do `kind` (em qualquer nível) ou, sem os dois,
+    as raízes (países). Da que tem mais lugares para a que tem menos. `limit`: 1 a 50.
+    """
+    locations(parentId: ID, kind: String, limit: Int = 20): [Location!]!
+    company(id: ID!): Company
+    tour(id: ID!): Tour
+    """
+    Passeios que passam por pelo menos um dos lugares (1 a 10 ids), primeiro os que passam por todos,
+    depois os que cobrem mais lugares. Ids desconhecidos são ignorados. `limit`: 1 a 50.
+    """
+    toursThrough(placeIds: [ID!]!, limit: Int = 20): [TourMatch!]!
+    """
+    Sugestões para o buscador de passeios: lugares que são parada de algum passeio, fora os de `placeIds`
+    (0 a 10), na ordem: mais passeios em comum com `placeIds`, com foto, melhor nota média, mais passeios.
+    `limit`: 1 a 50.
+    """
+    tourSuggestions(placeIds: [ID!] = [], limit: Int = 8): [Place!]!
+    "Usuário da sessão; null sem sessão."
+    me: User
+}
+
+input StopInput {
+    placeId: ID!
+    day: Int!
+    order: Int!
+}
+
+input ItineraryInput {
+    title: String!
+    isPublic: Boolean = false
+    stops: [StopInput!]!
+}
+
+"Todas requerem sessão."
+type Mutation {
+    "rating: 1 a 5 (opcional). Marcar de novo atualiza a data e a nota."
+    markVisited(placeId: ID!, rating: Int): Place!
+    wantToVisit(placeId: ID!): Place!
+    "Tira o lugar da lista \"quero visitar\" (idempotente)."
+    unwantToVisit(placeId: ID!): Place!
+    "Apaga a nota que o usuário deu ao lugar; a visita (e a data) continua. Idempotente."
+    removeVisitRating(placeId: ID!): Place!
+    follow(userId: ID!): User!
+    createItinerary(input: ItineraryInput!): Itinerary!
+}

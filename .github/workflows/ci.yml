@@ -1,0 +1,139 @@
+name: CI
+
+# Actions fixadas por SHA (tag só no comentário): uma tag pode ser movida, um commit não.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Estilo, análise estática e auditoria não dependem do patch do PHP: rodam no setup-php, que é rápido.
+  # O PHP que importa (o de produção) é o da imagem, no job `tests`.
+  quality:
+    name: Lint, static analysis and audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+        with:
+          php-version: '8.5'
+          extensions: bcmath, intl, pdo_pgsql, pcntl, posix
+          coverage: none
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: vendor
+          key: composer-${{ hashFiles('composer.lock') }}
+
+      - run: composer install --no-interaction --no-progress --prefer-dist
+
+      - name: Pint (style)
+        run: composer lint
+
+      - name: Larastan (static analysis)
+        run: composer analyse
+
+      - name: Composer audit (known vulnerabilities)
+        run: composer audit-deps
+
+      # Scripts de operação (backup, restore, deploy). O shellcheck já vem no runner ubuntu.
+      - name: ShellCheck (ops scripts)
+        run: shellcheck -x -e SC1091 scripts/*.sh
+
+  tests:
+    name: Tests in the production PHP image (Pest + Postgres 16 + Neo4j 5 + coverage)
+    runs-on: ubuntu-latest
+    # A suíte leva ~20 s; o build da imagem, 1-3 min. Os testes de concorrência matam filhos presos em
+    # 30 s (`runConcurrently`). Isto é o teto do job inteiro, para um travamento nunca segurar o runner por 6 h.
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16.14-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          # Os testes usam `${DB_DATABASE}_testing` (tests/TestCase.php).
+          POSTGRES_DB: duck_tail_testing
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      # Mesma imagem do docker-compose (o `neo4j-testing` local): os testes de Feature apagam este grafo.
+      neo4j:
+        image: neo4j:5.26.33-community
+        env:
+          NEO4J_AUTH: neo4j/ci_password
+          NEO4J_server_memory_heap_max__size: 512m
+        ports: ['7687:7687']
+        options: >-
+          --health-cmd "wget -qO- http://127.0.0.1:7474 || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+
+    env:
+      DB_CONNECTION: pgsql
+      DB_HOST: 127.0.0.1
+      DB_PORT: 5432
+      DB_DATABASE: duck_tail
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+      # O Neo4j "de desenvolvimento" não existe no CI; o `tests/TestCase.php` exige que o de teste seja outro.
+      NEO4J_URI: bolt://127.0.0.1:7600
+      NEO4J_TESTING_URI: bolt://127.0.0.1:7687
+      NEO4J_USERNAME: neo4j
+      NEO4J_PASSWORD: ci_password
+      # Roda um comando dentro da imagem construída abaixo, com o código montado como em produção
+      # (`docker-compose.production.yml`) e a rede do runner (o Postgres do `services` em 127.0.0.1).
+      IN_PHP_IMAGE: >-
+        docker run --rm --network host
+        -v ${{ github.workspace }}:/var/www/html
+        -v ${{ github.workspace }}/.docker/php/php.ini:/usr/local/etc/php/php.ini
+        -e PHP_OPCACHE_VALIDATE_TIMESTAMPS=1
+        -e DB_CONNECTION -e DB_HOST -e DB_PORT -e DB_DATABASE -e DB_USERNAME -e DB_PASSWORD
+        -e NEO4J_URI -e NEO4J_TESTING_URI -e NEO4J_USERNAME -e NEO4J_PASSWORD
+        duck-tail-php:ci
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # O mesmo Dockerfile da produção (mais o pcov, só aqui): um PR do Dependabot que sobe a imagem do
+      # PHP roda a suíte inteira na versão nova antes de chegar ao `make deploy`. Antes, o CI testava num
+      # PHP instalado pelo setup-php, e a imagem de produção só era construída no servidor.
+      - name: Build the PHP image (production Dockerfile + pcov)
+        run: docker build --build-arg UID="$(id -u)" --build-arg GID="$(id -g)" --build-arg INSTALL_PCOV=1 -t duck-tail-php:ci .docker/php
+
+      - name: Build the nginx image
+        run: docker build -t duck-tail-nginx:ci .docker/nginx
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: vendor
+          # O Dockerfile entra na chave: o vendor é instalado pelo PHP da imagem.
+          key: composer-image-${{ hashFiles('composer.lock', '.docker/php/Dockerfile') }}
+
+      - name: Composer install (inside the image)
+        run: $IN_PHP_IMAGE composer install --no-interaction --no-progress --prefer-dist
+
+      - name: Prepare .env
+        run: |
+          cp .env.example .env
+          $IN_PHP_IMAGE php artisan key:generate --ansi
+
+      # Unit + Feature (transação por teste no Postgres, grafo esvaziado por teste) e Concurrency
+      # (processos paralelos com pcntl_fork). Falha se a cobertura de linhas de `app/` cair abaixo de 95% (hoje ~96,5%).
+      - name: Pest with coverage
+        run: $IN_PHP_IMAGE composer test-coverage

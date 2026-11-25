@@ -1,0 +1,146 @@
+# Rotação dos logs dos containers (driver json-file do Docker): sem isto, o stderr da API cresce até
+# encher o disco do servidor. 5 arquivos de 10 MB por container; `make logs-docker` lê o mais recente.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  nginx:
+    container_name: duck-tail-api-nginx
+    logging: *default-logging
+    build:
+      context: .docker/nginx
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    tty: true
+    # Sem porta publicada: o web alcança a API pela rede do Nginx Proxy Manager
+    # (API_URL=http://duck-tail-api-nginx). Domínio e HTTPS ficam no NPM.
+    environment:
+      TZ: "${APP_TIMEZONE:-UTC}"
+    volumes:
+      - .:/var/www/html
+      - ./.docker/nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./.docker/nginx/conf.d/api.conf:/etc/nginx/conf.d/api.conf
+    networks:
+      - duck-tail-api-network
+      - proxy
+    depends_on:
+      php-fpm:
+        condition: service_healthy
+    # `/up` só responde 200 se o Laravel, o Postgres e o Neo4j responderem.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/up > /dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  php-fpm:
+    container_name: duck-tail-api-php
+    logging: *default-logging
+    build:
+      context: .docker/php
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    tty: true
+    environment:
+      TZ: "${APP_TIMEZONE:-UTC}"
+      PHP_OPCACHE_VALIDATE_TIMESTAMPS: "${PHP_OPCACHE_VALIDATE_TIMESTAMPS:-0}"
+    volumes:
+      - .:/var/www/html
+      - ./.docker/php/php.ini:/usr/local/etc/php/php.ini
+    networks:
+      - duck-tail-api-network
+    depends_on:
+      pgsql:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "php", "-r", "exit(@fsockopen('127.0.0.1', 9000) ? 0 : 1);"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Tarefas agendadas (routes/console.php), como a limpeza diária de tokens vencidos.
+  scheduler:
+    container_name: duck-tail-api-scheduler
+    logging: *default-logging
+    build:
+      context: .docker/php
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["php", "artisan", "schedule:work"]
+    environment:
+      TZ: "${APP_TIMEZONE:-UTC}"
+    volumes:
+      - .:/var/www/html
+      - ./.docker/php/php.ini:/usr/local/etc/php/php.ini
+    networks:
+      - duck-tail-api-network
+    depends_on:
+      pgsql:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+
+  pgsql:
+    container_name: duck-tail-api-postgres
+    logging: *default-logging
+    image: postgres:16.14-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_DATABASE}
+      POSTGRES_USER: ${DB_USERNAME}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      TZ: "${APP_TIMEZONE:-UTC}"
+    volumes:
+      - duck-tail-api-postgres-data:/var/lib/postgresql/data
+    networks:
+      - duck-tail-api-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME} -d ${DB_DATABASE}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  neo4j:
+    container_name: duck-tail-api-neo4j
+    logging: *default-logging
+    image: neo4j:5.26.33-community
+    restart: unless-stopped
+    # Sem porta publicada: só o php-fpm (rede interna) fala com o grafo.
+    environment:
+      NEO4J_AUTH: "${NEO4J_USERNAME}/${NEO4J_PASSWORD}"
+      NEO4J_server_memory_heap_initial__size: "${NEO4J_HEAP_SIZE:-512m}"
+      NEO4J_server_memory_heap_max__size: "${NEO4J_HEAP_SIZE:-512m}"
+      NEO4J_server_memory_pagecache_size: "${NEO4J_PAGECACHE_SIZE:-512m}"
+      TZ: "${APP_TIMEZONE:-UTC}"
+    volumes:
+      - duck-tail-api-neo4j-data:/data
+    networks:
+      - duck-tail-api-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:7474 > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+networks:
+  duck-tail-api-network:
+    name: duck-tail-api-network
+    driver: bridge
+  # Rede do Nginx Proxy Manager (já existe no servidor; `docker network ls` mostra o nome).
+  proxy:
+    name: ${PROXY_NETWORK:-nginx-proxy-manager}
+    external: true
+
+volumes:
+  duck-tail-api-postgres-data:
+    name: duck-tail-api-postgres-data
+  duck-tail-api-neo4j-data:
+    name: duck-tail-api-neo4j-data
